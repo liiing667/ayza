@@ -19,6 +19,7 @@ import nl.altindag.log.LogCaptor;
 import nl.altindag.ssl.IOTestUtils;
 import nl.altindag.ssl.SSLFactory;
 import nl.altindag.ssl.TestConstants;
+import nl.altindag.ssl.exception.GenericIOException;
 import nl.altindag.ssl.exception.GenericKeyStoreException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -46,9 +47,9 @@ import java.util.Collections;
 import java.util.Enumeration;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
-import java.util.stream.Stream;
 
 import static nl.altindag.ssl.TestConstants.IDENTITY_FILE_NAME;
 import static nl.altindag.ssl.TestConstants.IDENTITY_PASSWORD;
@@ -443,6 +444,79 @@ class KeyStoreUtilsShould {
         assertThat(actualAmountOfTrustMaterial).isEqualTo(expectedAmountOfTrustMaterial);
 
         Files.delete(truststorePath);
+    }
+
+    @Test
+    void writeKeyStoreAtomicallyToTheFileSystem() throws IOException, KeyStoreException {
+        KeyStore baseTruststore = KeyStoreUtils.loadKeyStore(KEYSTORE_LOCATION + TRUSTSTORE_FILE_NAME, TRUSTSTORE_PASSWORD);
+        Path truststorePath = Paths.get(TestConstants.HOME_DIRECTORY).resolve(Paths.get("atomic-truststore.jks"));
+        Path parentDirectory = truststorePath.getParent();
+
+        KeyStoreUtils.writeAtomic(truststorePath, baseTruststore, TRUSTSTORE_PASSWORD);
+
+        assertThat(Files.exists(truststorePath)).isTrue();
+        try (Stream<Path> files = Files.list(parentDirectory)) {
+            assertThat(files).doesNotContain(truststorePath.resolveSibling(truststorePath.getFileName() + ".tmp"));
+        }
+
+        KeyStore reloadedTruststore = KeyStoreUtils.loadKeyStore(truststorePath, TRUSTSTORE_PASSWORD);
+        assertThat(reloadedTruststore.size()).isEqualTo(baseTruststore.size());
+
+        Files.delete(truststorePath);
+    }
+
+    @Test
+    void writeKeyStoreAtomicallyReplacesTheExistingFile() throws IOException {
+        KeyStore initialTruststore = KeyStoreUtils.createKeyStore("PKCS12", TRUSTSTORE_PASSWORD);
+        KeyStore updatedTruststore = KeyStoreUtils.loadKeyStore(KEYSTORE_LOCATION + TRUSTSTORE_FILE_NAME, TRUSTSTORE_PASSWORD);
+
+        Path truststorePath = Paths.get(TestConstants.HOME_DIRECTORY).resolve(Paths.get("atomic-replaced-truststore.jks"));
+        KeyStoreUtils.writeAtomic(truststorePath, initialTruststore, TRUSTSTORE_PASSWORD);
+        assertThat(Files.exists(truststorePath)).isTrue();
+
+        KeyStoreUtils.writeAtomic(truststorePath, updatedTruststore, TRUSTSTORE_PASSWORD);
+
+        KeyStore reloadedTruststore = KeyStoreUtils.loadKeyStore(truststorePath, TRUSTSTORE_PASSWORD, "PKCS12");
+        assertThat(KeyStoreUtils.countAmountOfTrustMaterial(reloadedTruststore))
+                .isEqualTo(KeyStoreUtils.countAmountOfTrustMaterial(updatedTruststore));
+
+        Files.delete(truststorePath);
+    }
+
+    @Test
+    void writeKeyStoreAtomicallyDoesNotCreateAPartialFileWhenStoringFails() throws IOException, KeyStoreException, NoSuchAlgorithmException, java.security.cert.CertificateException {
+        KeyStore failingKeyStore = mock(KeyStore.class);
+        doThrow(new java.io.IOException("KABOOM!"))
+                .when(failingKeyStore)
+                .store(any(java.io.OutputStream.class), any());
+
+        Path truststorePath = Paths.get(TestConstants.HOME_DIRECTORY).resolve(Paths.get("atomic-failing-truststore.jks"));
+
+        assertThatThrownBy(() -> KeyStoreUtils.writeAtomic(truststorePath, failingKeyStore, TRUSTSTORE_PASSWORD))
+                .isInstanceOf(GenericIOException.class);
+
+        assertThat(Files.exists(truststorePath)).isFalse();
+        try (Stream<Path> files = Files.list(truststorePath.getParent())) {
+            assertThat(files).noneMatch(path -> path.getFileName().toString().contains("atomic-failing-truststore"));
+        }
+    }
+
+    @Test
+    void createAnIndependentCopyOfTheKeyStore() throws KeyStoreException, IOException {
+        KeyStore originalKeyStore = KeyStoreUtils.loadKeyStore(KEYSTORE_LOCATION + TRUSTSTORE_FILE_NAME, TRUSTSTORE_PASSWORD);
+        List<Certificate> additionalCertificates = CertificateUtils.loadCertificate(PEM_LOCATION + "github-certificate.pem");
+
+        KeyStore copiedKeyStore = KeyStoreUtils.copyKeyStore(originalKeyStore, TRUSTSTORE_PASSWORD);
+
+        assertThat(copiedKeyStore).isNotSameAs(originalKeyStore);
+        assertThat(copiedKeyStore.getType()).isEqualTo(originalKeyStore.getType());
+        assertThat(KeyStoreUtils.getCertificates(copiedKeyStore)).isEqualTo(KeyStoreUtils.getCertificates(originalKeyStore));
+
+        KeyStoreUtils.add(copiedKeyStore, additionalCertificates);
+
+        assertThat(KeyStoreUtils.countAmountOfTrustMaterial(copiedKeyStore))
+                .isGreaterThan(KeyStoreUtils.countAmountOfTrustMaterial(originalKeyStore));
+        assertThat(KeyStoreUtils.countAmountOfTrustMaterial(originalKeyStore)).isEqualTo(1);
     }
 
     @Test

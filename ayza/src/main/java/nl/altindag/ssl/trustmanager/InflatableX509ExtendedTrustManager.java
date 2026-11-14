@@ -62,7 +62,7 @@ public class InflatableX509ExtendedTrustManager extends HotSwappableX509Extended
     private static final Logger LOGGER = LoggerFactory.getLogger(InflatableX509ExtendedTrustManager.class);
     private static final BiPredicate<KeyStore, X509Certificate> IGNORE_DUPLICATE_CHECKER = (t, c) -> false;
 
-    private final KeyStore trustStore;
+    private KeyStore trustStore;
     private final Path trustStorePath;
     private final char[] trustStorePassword;
     private final Predicate<TrustManagerParameters> trustManagerParametersPredicate;
@@ -178,29 +178,45 @@ public class InflatableX509ExtendedTrustManager extends HotSwappableX509Extended
                 return;
             }
 
-            for (X509Certificate certificate : certificates) {
-                if (duplicateChecker.test(trustStore, certificate)) {
-                    continue;
+            KeyStore currentTrustStore = this.trustStore;
+
+            // Work on an isolated snapshot so the live trust set is not touched until the
+            // whole transaction (validation, memory switch and persistence) succeeds.
+            KeyStore newTrustStore = KeyStoreUtils.copyKeyStore(currentTrustStore, trustStorePassword);
+
+            try {
+                for (X509Certificate certificate : certificates) {
+                    if (duplicateChecker.test(currentTrustStore, certificate) || duplicateChecker.test(newTrustStore, certificate)) {
+                        continue;
+                    }
+
+                    String alias = generateAlias(newTrustStore, certificate);
+                    newTrustStore.setCertificateEntry(alias, certificate);
+                    LOGGER.info(String.format("Added certificate for [%s]", alias));
                 }
 
-                String alias = generateAlias(certificate);
-                trustStore.setCertificateEntry(alias, certificate);
-                LOGGER.info(String.format("Added certificate for [%s]", alias));
+                // Persist before swapping the in-memory state. Any failure leaves both the file
+                // system and the live trust set untouched, i.e. the transaction is rolled back.
+                getTrustStorePath().ifPresent(path -> KeyStoreUtils.writeAtomic(path, newTrustStore, trustStorePassword));
+
+                X509ExtendedTrustManager trustManager = KeyStoreUtils.containsTrustMaterial(newTrustStore)
+                        ? TrustManagerUtils.createTrustManager(newTrustStore)
+                        : TrustManagerUtils.createDummyTrustManager();
+
+                this.trustStore = newTrustStore;
+                setTrustManager(trustManager);
+            } catch (KeyStoreException e) {
+                throw new GenericKeyStoreException(e);
             }
-            X509ExtendedTrustManager trustManager = TrustManagerUtils.createTrustManager(trustStore);
-            setTrustManager(trustManager);
-            getTrustStorePath().ifPresent(path -> KeyStoreUtils.write(path, trustStore, trustStorePassword));
-        } catch (KeyStoreException | GenericKeyStoreException e) {
-            LOGGER.error("Cannot add certificate", e);
         } finally {
             writeLock.unlock();
         }
     }
 
-    private String generateAlias(Certificate certificate) {
+    private String generateAlias(KeyStore keyStore, Certificate certificate) {
         return CertificateUtils.generateUniqueAlias(certificate, alias -> {
             try {
-                return trustStore.containsAlias(alias);
+                return keyStore.containsAlias(alias);
             } catch (KeyStoreException e) {
                 throw new GenericKeyStoreException(e);
             }

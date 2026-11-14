@@ -25,11 +25,17 @@ import nl.altindag.sude.Logger;
 import nl.altindag.sude.LoggerFactory;
 
 import javax.net.ssl.X509TrustManager;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.security.GeneralSecurityException;
 import java.security.Key;
 import java.security.KeyStore;
 import java.security.KeyStoreException;
@@ -351,6 +357,68 @@ public final class KeyStoreUtils {
 
     public static void write(Path destination, KeyStore keyStore, char[] password) {
         IOUtils.write(destination, outputStream -> keyStore.store(outputStream, password), GenericIOException::new);
+    }
+
+    /**
+     * Writes the given keystore to the file system in an atomic fashion. The keystore is first fully
+     * written to a temporary file in the same directory and only moved into place once it has been
+     * successfully stored. This guarantees the destination file is never left in a partially written
+     * state, even when the process crashes or the storing of the keystore fails.
+     */
+    public static void writeAtomic(Path destination, KeyStore keyStore, char[] password) {
+        try {
+            Path parent = destination.toAbsolutePath().getParent();
+            if (parent != null) {
+                Files.createDirectories(parent);
+            }
+
+            Path temporaryFile = Files.createTempFile(parent, destination.getFileName().toString() + "-", ".tmp");
+            try {
+                try (OutputStream outputStream = Files.newOutputStream(temporaryFile)) {
+                    keyStore.store(outputStream, password);
+                }
+                move(temporaryFile, destination);
+            } catch (Exception e) {
+                try {
+                    Files.deleteIfExists(temporaryFile);
+                } catch (IOException cleanupFailure) {
+                    e.addSuppressed(cleanupFailure);
+                }
+                throw e;
+            }
+        } catch (IOException e) {
+            throw new GenericIOException(e);
+        } catch (GeneralSecurityException e) {
+            throw new GenericKeyStoreException(e);
+        }
+    }
+
+    private static void move(Path source, Path destination) throws IOException {
+        try {
+            Files.move(source, destination, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } catch (AtomicMoveNotSupportedException e) {
+            Files.move(source, destination, StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
+
+    /**
+     * Creates an independent in-memory copy of the given keystore. Mutations applied to the returned
+     * keystore do not affect the original keystore, which allows callers to prepare and validate a new
+     * trust set inside a transaction before swapping it in.
+     */
+    public static KeyStore copyKeyStore(KeyStore keyStore, char[] password) {
+        try (ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
+            keyStore.store(outputStream, password);
+            KeyStore copiedKeyStore = KeyStore.getInstance(keyStore.getType(), keyStore.getProvider());
+            try (ByteArrayInputStream inputStream = new ByteArrayInputStream(outputStream.toByteArray())) {
+                copiedKeyStore.load(inputStream, password);
+            }
+            return copiedKeyStore;
+        } catch (IOException e) {
+            throw new GenericIOException(e);
+        } catch (KeyStoreException | NoSuchAlgorithmException | CertificateException e) {
+            throw new GenericKeyStoreException(e);
+        }
     }
 
     /**
